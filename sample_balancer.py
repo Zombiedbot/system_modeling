@@ -1,7 +1,7 @@
 import numpy as np
-from script import (
+from model import (
     LoadBalancer, TargetGroup, ServerConfig, QueryMethod, PathHandlerConfig,
-    DistributionConfig, Query
+    DistributionConfig
 )
 
 LB = LoadBalancer(
@@ -40,8 +40,8 @@ LB = LoadBalancer(
                 )],
                 not_exist_process_time=3,
                 break_time_distr=DistributionConfig(
-                    distribution_func=np.random.normal,
-                    args=[100, 10, 1]
+                    distribution_func=np.random.uniform,
+                    args=[0, 259200, 1]
                 ),
                 init_time_distr=DistributionConfig(
                     distribution_func=np.random.normal,
@@ -51,8 +51,8 @@ LB = LoadBalancer(
             number_of_instances=6,
             health_check_path='v1/users',
             health_check_method=QueryMethod.get,
-            health_check_interval=30,
-            timeout=60
+            health_check_interval=121,
+            timeout=120
         ),
         TargetGroup(
             path_pattern='v2/',
@@ -76,7 +76,7 @@ LB = LoadBalancer(
                     method=QueryMethod.post,
                     time_distribution=DistributionConfig(
                         distribution_func=np.random.normal,
-                        args=[10, 0.05, 1]
+                        args=[3, 0.5, 1]
                     ),
                 ), PathHandlerConfig(
                     path='v2/report',
@@ -88,25 +88,19 @@ LB = LoadBalancer(
                 )],
                 not_exist_process_time=3,
                 break_time_distr=DistributionConfig(
-                    distribution_func=np.random.normal,
-                    args=[100, 10, 1]
+                    distribution_func=np.random.uniform,
+                    args=[0, 129600, 1]
                 ),
                 init_time_distr=DistributionConfig(
                     distribution_func=np.random.normal,
-                    args=[100, 10, 1]
+                    args=[120, 10, 1]
                 ),
             ),
             number_of_instances=2,
             health_check_path='v2/users',
             health_check_method=QueryMethod.get,
-            health_check_interval=30,
-            timeout=60
+            health_check_interval=121,
+            timeout=120
         )
     ]
 )
-
-
-if __name__ == '__main__':
-    LB.dispatch(Query(method=QueryMethod.get, path='v2/users', session_key='1'), 11.3)
-    LB.dispatch(Query(method=QueryMethod.post, path='v1/auth', session_key='2'), 25.24)
-    LB.dispatch(Query(method=QueryMethod.get, path='v2/report', session_key='1'), 30.1)

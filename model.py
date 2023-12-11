@@ -1,4 +1,5 @@
 import dataclasses
+import random
 from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
@@ -46,7 +47,7 @@ class ServerConfig:
     break_time_distr: DistributionConfig
     init_time_distr: DistributionConfig
     state: str = 'healthy'
-    _queue_changes: PriorityQueue = PriorityQueue()
+    _queue_changes: PriorityQueue = dataclasses.field(default_factory=PriorityQueue)
     _release_time: float = 0
 
     def __post_init__(self):
@@ -60,12 +61,25 @@ class ServerConfig:
             if handler.path == query.path and handler.method == query.method:
                 time_to_process = handler.dispatch()
                 break
-        request_time_processing_start = max(time_to_process, self._release_time)
-        self._release_time = request_time_processing_start + current_time
+        request_time_processing_start = max(current_time, self._release_time)
+        self._release_time = request_time_processing_start + time_to_process
         self._queue_changes.put((current_time, 'added'))
-        self._queue_changes.put((request_time_processing_start, 'removed'))
+        self._queue_changes.put((self._release_time, 'removed'))
         return self._release_time - current_time, time_to_process
 
+    def get_queue_history(self) -> tuple[list[float], list[float]]:
+        cur_size = 0
+        q_length = []
+        times = []
+        while not self._queue_changes.empty():
+            time, event_name = self._queue_changes.get()
+            times.append(time)
+            if event_name == 'added':
+                cur_size += 1
+            else:
+                cur_size -= 1
+            q_length.append(cur_size)
+        return times, q_length
 
 @dataclass
 class TargetGroup:
@@ -79,10 +93,11 @@ class TargetGroup:
     _events: PriorityQueue = dataclasses.field(default_factory=PriorityQueue)
     _ptr: int = 0
     _servers: dict[int, ServerConfig] = dataclasses.field(default_factory=dict)
-    _response_waits: set[float] = dataclasses.field(default_factory=set)
-    _processing_waits: set[float] = dataclasses.field(default_factory=set)
+    _response_waits: list[tuple[float, float]] = dataclasses.field(default_factory=list)
+    _processing_waits: list[float] = dataclasses.field(default_factory=list)
     _sticky_mapper: dict[str, int] = dataclasses.field(default_factory=dict)
     _instances_history: list[ServerConfig] = dataclasses.field(default_factory=list)
+    _timeouts: list[float] = dataclasses.field(default_factory=list)
     _health_check_max_time: float = 0
 
     def __post_init__(self):
@@ -125,21 +140,26 @@ class TargetGroup:
                 query = Query(self.health_check_path, self.health_check_method, '')
                 release_time, time_to_process = self._servers[idx].dispatch(query, time)
 
-                if release_time - time >= self.timeout:
+                if release_time >= self.timeout:
                     self.put_event(time + self.timeout, idx, 'make_unhealthy')
                     return
-                self.put_event(release_time, {'id': idx, 'submit_time': time}, 'health_check_response')
+                self.put_event(release_time + time, (idx, time), 'health_check_response')
         elif event_type == 'health_check_response':
-            idx, submit_time = body['id'], body['submit_time']
+            idx, submit_time = body
             if self._servers[idx].state == 'broken':
                 self.put_event(submit_time + self.timeout, idx, 'make_unhealthy')
                 return
         elif event_type == 'make_unhealthy':
             idx = body
+            new_server = ServerConfig(
+                path_handlers=self.server_config.path_handlers,
+                not_exist_process_time=self.server_config.not_exist_process_time,
+                break_time_distr=self.server_config.break_time_distr,
+                init_time_distr=self.server_config.init_time_distr
+            )
+            self._servers[idx] = new_server
             init_time = self._servers[idx].init_time_distr.sample()
             start_time = time + init_time
-            new_server = dataclasses.replace(self.server_config)
-            self._servers[idx] = new_server
             self._instances_history.append(new_server)
             new_server.state = 'init'
             self.put_event(start_time, idx, 'init_finish')
@@ -149,57 +169,69 @@ class TargetGroup:
         elif event_type == 'init_finish':
             idx = body
             self._servers[idx].state = 'healthy'
+        elif event_type == 'query':
+            query = body
+            for i in range(self.number_of_instances):
+                if self._servers[self._ptr].state != 'init':
+                    break
+                self._ptr = (self._ptr + 1) % len(self._servers)
 
-        # add health checks updates
-
-    def dispatch(self, query: Query, time: float) -> bool:
-        self.put_event(time, query, 'query')
-        t, q, e = self._events.get()
-
-        while e != 'query':
-            self.handle(t, q, e)
-            t, q, e = self._events.get()
-
-        for i in range(self.number_of_instances):
-            if self._servers[self._ptr].state != 'init':
-                break
-            self._ptr += 1
-
-        ptr = self._ptr
-        if not query.use_sticky:
-            self._ptr += 1
-        else:
-            if not query.session_key not in self._sticky_mapper:
-                self._sticky_mapper[query.session_key] = self._ptr
-                self._ptr += 1
-            ptr = self._sticky_mapper[query.session_key]
-        response_wait, processing_wait = self._servers[ptr].dispatch(query, time)
-        will_fail = False
-        if self._servers[ptr].state != 'healthy' or response_wait > self.timeout:
-            self.put_event(time + self.timeout, ptr, 'query_fail')
-            self._response_waits.add(self.timeout)
-            self._processing_waits.add(self.timeout)
-            will_fail = True
-        else:
-            self.put_event(time + response_wait, {'idx': ptr, 'response_wait': response_wait}, 'query_response')
-            self._response_waits.add(response_wait)
-            self._processing_waits.add(processing_wait)
-
-        t, q, e = self._events.get()
-        if not will_fail:
-            while e != 'query_response':
-                self.handle(t, q, e)
-                t, q, e = self._events.get()
-            idx, response_wait = q['idx'], q['response_wait']
+            ptr = self._ptr
+            if not query.use_sticky:
+                self._ptr = (self._ptr + 1) % len(self._servers)
+            else:
+                if query.session_key not in self._sticky_mapper:
+                    self._sticky_mapper[query.session_key] = self._ptr
+                    self._ptr = (self._ptr + 1) % len(self._servers)
+                ptr = self._sticky_mapper[query.session_key]
+            response_wait, processing_wait = self._servers[ptr].dispatch(query, time)
+            if self._servers[ptr].state != 'healthy' or response_wait > self.timeout:
+                self.put_event(time + self.timeout, ptr, 'query_fail')
+                self._response_waits.append((time, self.timeout))
+                self._processing_waits.append(self.timeout)
+            else:
+                self.put_event(
+                    time + response_wait,
+                    (ptr, response_wait),
+                    'query_response'
+                )
+                self._response_waits.append((time, response_wait))
+                self._processing_waits.append(processing_wait)
+        elif event_type == 'query_response':
+            idx, response_wait = body
             if self._servers[idx].state == 'healthy':
                 return True
             if self._servers[idx].state != 'healthy':
-                self.put_event(t - response_wait + self.timeout, ptr, 'query_fail')
+                self.put_event(time - response_wait + self.timeout, idx, 'query_fail')
+        elif event_type == 'query_fail':
+            self._timeouts.append(time)
 
-        while e != 'query_fail':
-            self.handle(t, q, e)
+    def dispatch_many(self, queries: list[tuple[Query, float]]):
+        max_t = 0
+        for query, time in queries:
+            max_t = max(max_t, time)
+            self.put_event(time, query, 'query')
+
+        while self._events.qsize():
             t, q, e = self._events.get()
-        return False
+            if t > max_t + self.timeout:
+                break
+            self.handle(t, q, e)
+
+    def get_response_waits(self) -> tuple[list[float], list[float]]:
+        times = []
+        waits = []
+        for time, wait in sorted(self._response_waits):
+            times.append(time)
+            waits.append(wait)
+        return times, waits
+
+    def get_queue_sizes(self) -> list[tuple[list[float], list[float]]]:
+        return [server.get_queue_history() for server in self._instances_history]
+
+    def get_timeouts(self) -> tuple[list[float], list[float]]:
+        values = [i for i in range(len(self._timeouts) + 1)]
+        return [0] + self._timeouts + [86400], values + [len(self._timeouts)]
 
 
 @dataclass
@@ -207,10 +239,26 @@ class LoadBalancer:
     target_groups: list[TargetGroup]
     _timeouts: list[float] = dataclasses.field(default_factory=list)
 
-    def dispatch(self, query: Query, time: float):
+    def dispatch_many(self, queries: list[tuple[Query, float]]):
+        queries_for_tg: list[list[tuple[Query, float]]] = [[] for _ in range(len(self.target_groups))]
+        for query, time in queries:
+            for idx, tg in enumerate(self.target_groups):
+                if query.path.startswith(tg.path_pattern):
+                    queries_for_tg[idx].append((query, time))
+                    break
+        for idx, tg in enumerate(self.target_groups):
+            tg.dispatch_many(queries_for_tg[idx])
+
+    def random_query(self, max_sessions: int, use_sticky: bool) -> Query:
+        path_handlers = []
         for tg in self.target_groups:
-            if query.path.startswith(tg.path_pattern):
-                res = tg.dispatch(query, time)
-                if not res:
-                    self._timeouts.append(time + tg.timeout)
-                break
+            for path_handler in tg.server_config.path_handlers:
+                path_handlers.append(path_handler)
+        path_handler = random.choice(path_handlers[:-1])
+        session = str(random.randint(0, max_sessions))
+        return Query(
+            path=path_handler.path,
+            method=path_handler.method,
+            session_key=session,
+            use_sticky=use_sticky
+        )
